@@ -1,14 +1,19 @@
+// scripts/enable_trading.js
 const { ethers } = require("hardhat");
 require("dotenv").config();
 
 async function main() {
+  const CONTRACT = process.env.CONTRACT_ADDRESS;
+  const DEAD = Number(process.env.DEAD_BLOCKS ?? 2);
+  if (!CONTRACT) throw new Error("Missing CONTRACT_ADDRESS in .env");
+
   const [deployer] = await ethers.getSigners();
-  const token = await ethers.getContractAt("PalaemonCoin", process.env.CONTRACT_ADDRESS, deployer);
+  const token = await ethers.getContractAt("PalaemonCoin", CONTRACT, deployer);
 
   console.log("🔍 Checking current trading status...");
   const tradingActive = await token.tradingActive();
-  const liquidityPair = await token.liquidityPair();
-  
+  let liquidityPair = await token.liquidityPair();
+
   console.log(`Trading Active: ${tradingActive}`);
   console.log(`Liquidity Pair: ${liquidityPair}`);
 
@@ -17,44 +22,45 @@ async function main() {
     return;
   }
 
-  // Check if liquidity pair exists
+  // Ensure pair is recorded on-chain (needed by enableTrading)
   if (liquidityPair === ethers.ZeroAddress) {
-    console.log("❌ Must add liquidity first!");
-    return;
+    console.log("🧩 Pair not set on contract. Calling initializePair()…");
+    const txInit = await token.initializePair();
+    console.log("  → tx:", txInit.hash);
+    await txInit.wait();
+    liquidityPair = await token.liquidityPair();
+    console.log("✅ Pair after init:", liquidityPair);
+    if (liquidityPair === ethers.ZeroAddress) {
+      throw new Error("❌ Pair still zero after initializePair().");
+    }
   }
 
-  console.log("🚀 Enabling trading with 2 dead blocks (anti-sniper protection)...");
-  
+  console.log(`🚀 Enabling trading with ${DEAD} dead blocks (anti-sniper) …`);
   try {
-    const tx = await token.enableTrading(2); // 2 dead blocks = 99% fee for snipers
+    const tx = await token.enableTrading(DEAD);
+    console.log("  → tx:", tx.hash);
     await tx.wait();
-    
-    console.log("✅ Trading enabled!");
-    console.log("🛡️  Anti-sniper protection: 2 dead blocks with 99% fees");
-    console.log("💰 Ready for testing all transaction types!");
-    
-    // Verify it worked
-    const newTradingStatus = await token.tradingActive();
-    const tradingActiveBlock = await token.tradingActiveBlock();
-    const deadBlocks = await token.deadBlocks();
-    
-    console.log(`\n📊 Trading Status:`);
-    console.log(`  Active: ${newTradingStatus}`);
-    console.log(`  Launch Block: ${tradingActiveBlock}`);
-    console.log(`  Dead Blocks: ${deadBlocks}`);
-    
-    console.log("\n🧪 Now you can test:");
-    console.log("  • Wallet-to-wallet transfers (2% charity fee)");
-    console.log("  • DEX buy/sell trades (5% total fees)");
-    console.log("  • Anti-whale limits (max 1% tx, 2% wallet)");
-    console.log("  • Auto-liquidity triggers (at 500K PAL threshold)");
-    
+
+    // Verify
+    const [live, launchBlock, deadBlocks] = await Promise.all([
+      token.tradingActive(),
+      token.tradingActiveBlock(),
+      token.deadBlocks(),
+    ]);
+
+    console.log("\n✅ Trading enabled!");
+    console.log(`📊 Active: ${live}`);
+    console.log(`📊 Launch Block: ${Number(launchBlock)}`);
+    console.log(`📊 Dead Blocks: ${Number(deadBlocks)}`);
+
+    console.log("\n🧪 You can now test:");
+    console.log("  • Wallet→wallet (2% charity)");
+    console.log("  • DEX buy/sell (5% total: 2% charity, 1% dev, 2% liq)");
+    console.log("  • MaxTx (1%) / MaxWallet (2%)");
+    console.log("  • Auto-liquidity at 500k PAL");
   } catch (error) {
-    console.error("❌ Error enabling trading:", error.message);
-    if (error.message.includes("TradingEnabled")) {
-      console.log("💡 Remove the 'emit TradingEnabled' line from your contract or add the event declaration");
-    }
+    console.error("❌ Error enabling trading:", error.shortMessage || error.message);
   }
 }
 
-main().catch(console.error);
+main().catch((e) => { console.error(e); process.exit(1); });

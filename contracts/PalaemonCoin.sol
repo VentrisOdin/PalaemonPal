@@ -11,18 +11,17 @@ contract PalaemonCoin is ERC20, Ownable {
     // ---- Events ----
     event PairInitialized(address pair);
     event SwapAndLiquify(uint256 tokensSwapped, uint256 bnbReceived, uint256 tokensIntoLiquidity);
-    event TradingActivated(uint256 blockNumber, uint256 deadBlocks);
+    event TradingActivated(uint256 blockNumber, uint256 deadBlocks); // keep signature; emit 0 for deadBlocks
     event LimitsUpdated(uint256 maxTxAmount, uint256 maxWalletAmount);
-    event TransferDelayToggled(bool enabled);
     event ExcludedFromLimits(address indexed account, bool isExcluded);
     event WalletsUpdated(address indexed newCharity, address indexed newDev);
     event SwapThresholdUpdated(uint256 newThreshold);
     event AutoLiquidityWalletUpdated(address indexed oldWallet, address indexed newWallet);
 
-    // ---- Fee exclusions (existing) ----
+    // ---- Fee exclusions ----
     mapping(address => bool) public isExcludedFromFees;
 
-    // ---- New: Limit exclusions (anti-whale) ----
+    // ---- Limit exclusions (anti-whale) ----
     mapping(address => bool) public isExcludedFromLimits;
 
     // ---- Project wallets ----
@@ -39,14 +38,8 @@ contract PalaemonCoin is ERC20, Ownable {
     bool public swapAndLiquifyEnabled = true;
     uint256 public minTokensBeforeSwap; // set in constructor
 
-    // ---- Anti-sniper / trading gates ----
-    bool    public tradingActive;
-    uint256 public tradingActiveBlock;
-    uint256 public deadBlocks = 2;              // set on enableTrading
-    uint256 public constant PUNITIVE_FEE = 99;  // 99% for dead blocks
-
-    bool public transferDelayEnabled = true; // 1 tx / block during launch
-    mapping(address => uint256) private _holderLastTransferBlock;
+    // ---- Trading gate (keep, sans dead-block logic) ----
+    bool public tradingActive;
 
     // ---- Anti-whale limits ----
     uint256 public maxTxAmount;     // default 1% of total supply
@@ -60,7 +53,7 @@ contract PalaemonCoin is ERC20, Ownable {
 
     constructor(
         address initialOwner,
-        address initialSupplyRecipient,     // NEW: Treasury wallet
+        address initialSupplyRecipient,     // Treasury wallet
         address _charityWallet,
         address _devWallet,
         address _router,
@@ -77,30 +70,30 @@ contract PalaemonCoin is ERC20, Ownable {
         router = IUniswapV2Router02(_router);
         autoLiquidityWallet = _autoLiquidityWallet;
 
-        // ---- FIRST: Set exclusions BEFORE minting ----
-        isExcludedFromFees[initialOwner]     = true;
-        isExcludedFromFees[address(this)]    = true;
-        isExcludedFromFees[_charityWallet]   = true;
-        isExcludedFromFees[_devWallet]       = true;
-        isExcludedFromFees[initialSupplyRecipient] = true; // NEW: Treasury excluded
+        // ---- Exclusions BEFORE minting ----
+        isExcludedFromFees[initialOwner]                 = true;
+        isExcludedFromFees[address(this)]                = true;
+        isExcludedFromFees[_charityWallet]               = true;
+        isExcludedFromFees[_devWallet]                   = true;
+        isExcludedFromFees[initialSupplyRecipient]       = true;
 
-        isExcludedFromLimits[initialOwner]     = true;
-        isExcludedFromLimits[address(this)]    = true;
-        isExcludedFromLimits[_charityWallet]   = true;
-        isExcludedFromLimits[_devWallet]       = true;
-        isExcludedFromLimits[_autoLiquidityWallet] = true;
-        isExcludedFromLimits[initialSupplyRecipient] = true; // NEW: Treasury excluded
+        isExcludedFromLimits[initialOwner]               = true;
+        isExcludedFromLimits[address(this)]              = true;
+        isExcludedFromLimits[_charityWallet]             = true;
+        isExcludedFromLimits[_devWallet]                 = true;
+        isExcludedFromLimits[_autoLiquidityWallet]       = true;
+        isExcludedFromLimits[initialSupplyRecipient]     = true;
 
-        // ---- THEN: Set limits ----
-        uint256 totalSupply = 1_000_000_000 * 10 ** decimals();
-        maxTxAmount     = totalSupply / 100; // 1% of total supply = 10 million
-        maxWalletAmount = totalSupply / 50;  // 2% of total supply = 20 million
+        // ---- Limits ----
+        uint256 total = 1_000_000_000 * 10 ** decimals();
+        maxTxAmount     = total / 100; // 1% of supply
+        maxWalletAmount = total / 50;  // 2% of supply
 
-        // Set swap threshold (~0.05% of supply): 500,000 PAL
+        // ~0.05% of supply
         minTokensBeforeSwap = 500_000 * 10 ** decimals();
 
-        // ---- FINALLY: Mint tokens to treasury wallet ----
-        _mint(initialSupplyRecipient, totalSupply);
+        // ---- Mint to treasury ----
+        _mint(initialSupplyRecipient, total);
     }
 
     receive() external payable {}
@@ -126,7 +119,7 @@ contract PalaemonCoin is ERC20, Ownable {
             liquidityPair = existingPair;
         }
 
-        // Pair & router shouldn't be hindered by wallet limits
+        // Pair & router excluded from wallet limits
         isExcludedFromLimits[liquidityPair] = true;
         isExcludedFromLimits[address(router)] = true;
 
@@ -141,26 +134,18 @@ contract PalaemonCoin is ERC20, Ownable {
 
     // ---------------- Launch Controls ----------------
 
-    function enableTrading(uint256 _deadBlocks) external onlyOwner {
+    function enableTrading() external onlyOwner {
         require(!tradingActive, "Trading already active");
         require(liquidityPair != address(0), "Must initialize pair first");
-        
         tradingActive = true;
-        deadBlocks = _deadBlocks;
-        tradingActiveBlock = block.number;
-        
-        emit TradingActivated(block.number, _deadBlocks);
-    }
-
-    function setTransferDelayEnabled(bool enabled) external onlyOwner {
-        transferDelayEnabled = enabled;
-        emit TransferDelayToggled(enabled);
+        // Keep event signature stable; report 0 deadBlocks
+        emit TradingActivated(block.number, 0);
     }
 
     // ---------------- Anti-Whale Admin ----------------
 
     function setLimits(uint256 _maxTxAmount, uint256 _maxWalletAmount) external onlyOwner {
-        require(_maxTxAmount >= totalSupply() / 1000, "maxTx too small");       // >=0.1%
+        require(_maxTxAmount >= totalSupply() / 1000, "maxTx too small");        // >=0.1%
         require(_maxWalletAmount >= totalSupply() / 500, "maxWallet too small"); // >=0.2%
         maxTxAmount = _maxTxAmount;
         maxWalletAmount = _maxWalletAmount;
@@ -206,10 +191,10 @@ contract PalaemonCoin is ERC20, Ownable {
         isExcludedFromLimits[newWallet] = true;
     }
 
-    // ---- Core transfer logic ----------------
+    // ---------------- Core transfer logic ----------------
 
     function _update(address from, address to, uint256 amount) internal override {
-        // Before-trading gate (allow owner/fee-exempt for setup)
+        // Trading gate: allow owner/fee-exempt for setup before opening
         if (!tradingActive) {
             require(
                 isExcludedFromFees[from] || isExcludedFromFees[to] || from == owner() || to == owner(),
@@ -217,14 +202,8 @@ contract PalaemonCoin is ERC20, Ownable {
             );
         }
 
-        // Transfer delay: 1 tx per block per origin (except direct router/pair interactions)
-        if (transferDelayEnabled && to != address(router) && to != liquidityPair) {
-            require(_holderLastTransferBlock[tx.origin] < block.number, "Transfer Delay: 1 tx per block");
-            _holderLastTransferBlock[tx.origin] = block.number;
-        }
-
-        bool isBuy  = from == liquidityPair && to != address(router);
-        bool isSell = to == liquidityPair && from != address(router);
+        bool isBuy  = (from == liquidityPair && to != address(router));
+        bool isSell = (to == liquidityPair && from != address(router));
         bool isDEXTrade = isBuy || isSell;
 
         // Anti-whale checks (skip for excluded)
@@ -239,13 +218,13 @@ contract PalaemonCoin is ERC20, Ownable {
             }
         }
 
-        // If either side is fee-exempt, skip fees entirely
+        // Fee-exempt => passthrough
         if (isExcludedFromFees[from] || isExcludedFromFees[to]) {
             super._update(from, to, amount);
             return;
         }
 
-        // Trigger swap and liquify only when sending from non-pair, and not already swapping
+        // Swap & liquify trigger (on outbound, not during buys)
         uint256 contractTokenBalance = balanceOf(address(this));
         if (
             contractTokenBalance >= minTokensBeforeSwap &&
@@ -261,12 +240,8 @@ contract PalaemonCoin is ERC20, Ownable {
         uint256 devFee;
         uint256 liquidityFee;
 
-        // Anti-sniper punitive fee during dead blocks (applied to DEX trades only)
-        if (tradingActive && block.number <= tradingActiveBlock + deadBlocks && isDEXTrade) {
-            fees = (amount * PUNITIVE_FEE) / 100;
-            super._update(from, address(this), fees); // send punitive to contract
-        } else if (isDEXTrade) {
-            // DEX trades: Full 5% fee (2% charity, 1% dev, 2% liquidity)
+        if (isDEXTrade) {
+            // DEX trades: 5% (2% charity, 1% dev, 2% liquidity)
             charityFee   = (amount * 2) / 100;
             devFee       = (amount * 1) / 100;
             liquidityFee = (amount * 2) / 100;
@@ -276,7 +251,7 @@ contract PalaemonCoin is ERC20, Ownable {
             if (devFee > 0)       super._update(from, devWallet,     devFee);
             if (liquidityFee > 0) super._update(from, address(this),  liquidityFee);
         } else {
-            // Wallet-to-wallet: Only 2% charity fee
+            // Wallet-to-wallet: 2% charity only
             charityFee = (amount * 2) / 100;
             fees = charityFee;
 
@@ -305,7 +280,7 @@ contract PalaemonCoin is ERC20, Ownable {
     }
 
     function swapTokensForBNB(uint256 tokenAmount) private {
-        address[] memory path = new address[](2);
+        address;
         path[0] = address(this);
         path[1] = router.WETH();
 
